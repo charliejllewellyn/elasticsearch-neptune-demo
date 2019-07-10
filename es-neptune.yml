@@ -1,0 +1,346 @@
+---
+Description: Create Amazon Neptune cluster and Amazon SageMaker notebook
+Parameters:
+  NotebookContentS3Locations:
+    Description: 'OPTIONAL: S3 locations of the notebooks to install into the notebook
+      instance.'
+    Type: String
+  DbInstanceType:
+    Description: Neptune DB instance type
+    Type: String
+    Default: db.r4.xlarge
+    AllowedValues:
+    - db.r4.large
+    - db.r4.xlarge
+    - db.r4.2xlarge
+    - db.r4.4xlarge
+    - db.r4.8xlarge
+    - db.r5.large
+    - db.r5.xlarge
+    - db.r5.2xlarge
+    - db.r5.4xlarge
+    - db.r5.12xlarge
+    ConstraintDescription: Must be a valid Neptune instance type.
+  ElasticsearchDomainName:
+    Description: ES domain name
+    Default: enron
+    Type: String
+  ElasticsearchIndexName:
+    Description: ES domain name
+    Default: enron
+    Type: String
+  FirehoseName:
+    Description: Firehose domain name
+    Default: enron
+    Type: String
+Resources:
+  NeptuneBaseStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: https://s3.amazonaws.com/aws-neptune-customer-samples/v2/cloudformation-templates/neptune-base-stack.json
+      Parameters:
+        NeptuneQueryTimeout: '300000'
+        DbInstanceType:
+          Ref: DbInstanceType
+      TimeoutInMinutes: '60'
+  SageMakerNeptuneStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: https://s3.amazonaws.com/aws-neptune-customer-samples/neptune-sagemaker/cloudformation-templates/neptune-sagemaker/neptune-sagemaker-nested-stack.json
+      Parameters:
+        NeptuneClusterEndpoint:
+          Fn::GetAtt:
+          - NeptuneBaseStack
+          - Outputs.DBClusterEndpoint
+        NeptuneReaderEndpoint:
+          Fn::GetAtt:
+          - NeptuneBaseStack
+          - Outputs.DBClusterReadEndpoint
+        NeptuneClusterPort:
+          Fn::GetAtt:
+          - NeptuneBaseStack
+          - Outputs.DBClusterPort
+        NeptuneClusterVpc:
+          Fn::GetAtt:
+          - NeptuneBaseStack
+          - Outputs.VPC
+        NeptuneClusterSubnetId:
+          Fn::GetAtt:
+          - NeptuneBaseStack
+          - Outputs.PublicSubnet1
+        NeptuneLoadFromS3RoleArn:
+          Fn::GetAtt:
+          - NeptuneBaseStack
+          - Outputs.NeptuneLoadFromS3IAMRoleArn
+        NeptuneClientSecurityGroup: ''
+        NotebookContentS3Locations:
+          Ref: NotebookContentS3Locations
+      TimeoutInMinutes: '60'
+  AddIamRoleToNeptuneStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: https://s3.amazonaws.com/aws-neptune-customer-samples/neptune-sagemaker/cloudformation-templates/common/add-iam-role-to-neptune.json
+      Parameters:
+        DBClusterId:
+          Fn::GetAtt:
+          - NeptuneBaseStack
+          - Outputs.DBClusterId
+        NeptuneLoadFromS3IAMRoleArn:
+          Fn::GetAtt:
+          - NeptuneBaseStack
+          - Outputs.NeptuneLoadFromS3IAMRoleArn
+      TimeoutInMinutes: '60'
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: "KibanaUsers"
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          DeveloperOnlyAttribute: false
+          Mutable: true
+          Required: true
+
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: "KibanaIDPool"
+      AllowUnauthenticatedIdentities: true
+      # CognitoIdentityProviders:
+      #   - ClientId: !Ref UserPoolClient
+      #     ProviderName: !Sub "cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+
+  AuthenticatedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "es:ESHttp*"
+            Resource:
+              - "*"
+              
+  AuthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: "sts:AssumeRoleWithWebIdentity"
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Condition:
+              StringEquals:
+                "cognito-identity.amazonaws.com:aud": !Ref IdentityPool
+              ForAnyValue:StringLike:
+                "cognito-identity.amazonaws.com:amr": authenticated
+      ManagedPolicyArns: 
+        - !Ref AuthenticatedPolicy
+        
+  RoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt AuthenticatedRole.Arn
+  ElasticsearchDomain: 
+    Type: AWS::Elasticsearch::Domain
+    Properties:
+      DomainName: !Sub "${ElasticsearchDomainName}"
+      ElasticsearchClusterConfig: 
+        InstanceCount: "1"
+        InstanceType: "m4.large.elasticsearch"
+      EBSOptions: 
+        EBSEnabled: true
+        Iops: 0
+        VolumeSize: 10
+        VolumeType: "gp2"
+      SnapshotOptions: 
+        AutomatedSnapshotStartHour: "0"
+      AccessPolicies: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "es:*"
+            Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ElasticsearchDomainName}/*"
+
+  ESDeliveryStream: 
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn:
+      - DeliveryRole
+      - DeliveryPolicy
+      - ElasticsearchDomain
+    Properties:
+      DeliveryStreamName: !Sub "${FirehoseName}"
+      DeliveryStreamType: "DirectPut"
+      ElasticsearchDestinationConfiguration: 
+        BufferingHints: 
+          IntervalInSeconds: "60"
+          SizeInMBs: 50
+        CloudWatchLoggingOptions: 
+          Enabled: true
+          LogGroupName: "deliverystream"
+          LogStreamName: "elasticsearchDelivery"
+        DomainARN: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ElasticsearchDomainName}"
+        IndexName: "enron"
+        IndexRotationPeriod: "NoRotation"
+        TypeName: "fromFirehose"
+        RetryOptions: 
+          DurationInSeconds: "60"
+        RoleARN: !GetAtt DeliveryRole.Arn
+        S3BackupMode: "AllDocuments"
+        S3Configuration: 
+          BucketARN: !Sub "arn:aws:s3:::${LogBucket}"
+          BufferingHints: 
+            IntervalInSeconds: "60"
+            SizeInMBs: "50"
+          CompressionFormat: "UNCOMPRESSED"
+          Prefix: "log/"
+          RoleARN: !GetAtt DeliveryRole.Arn 
+          CloudWatchLoggingOptions: 
+            Enabled: true
+            LogGroupName: "deliverystream"
+            LogStreamName: "s3Backup"
+
+  DeliveryRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: 'sts:AssumeRole'
+            Principal:
+              Service:
+                - 'firehose.amazonaws.com'
+            Condition:
+              StringEquals:
+                'sts:ExternalId' : !Ref 'AWS::AccountId'
+      RoleName: "DeliveryRole"
+
+  DeliveryPolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: "DeliveryPolicy"
+      Roles:
+        - !Ref "DeliveryRole"
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:AbortMultipartUpload'
+              - 's3:GetBucketLocation'
+              - 's3:GetObject'
+              - 's3:ListBucket'
+              - 's3:ListBucketMultipartUploads'
+              - 's3:PutObject'
+              - 's3:PutObjectAcl'
+            Resource:
+              - !Sub 'arn:aws:s3:::${LogBucket}'
+              - !Sub 'arn:aws:s3:::${LogBucket}/*'
+          - Effect: Allow
+            Action:
+              - 'lambda:InvokeFunction'
+              - 'lambda:GetFunctionConfiguration'
+            Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:%FIREHOSE_DEFAULT_FUNCTION%:%FIREHOSE_DEFAULT_VERSION%'
+          - Effect: Allow
+            Action:
+              - 'es:DescribeElasticsearchDomain'
+              - 'es:DescribeElasticsearchDomains'
+              - 'es:DescribeElasticsearchDomainConfig'
+              - 'es:ESHttpPost'
+              - 'es:ESHttpPut'
+            Resource:
+              - !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ElasticsearchDomainName}"
+              - !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ElasticsearchDomainName}/*"
+          - Effect: Allow
+            Action:
+              - 'es:ESHttpGet'
+            Resource:
+              - !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ElasticsearchDomainName}/_all/_settings'
+              - !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ElasticsearchDomainName}/_cluster/stats'
+              - !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ElasticsearchDomainName}/${ElasticsearchIndexName}*/_mapping/superstore'
+              - !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ElasticsearchDomainName}/_nodes'
+              - !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ElasticsearchDomainName}/_nodes/stats'
+              - !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ElasticsearchDomainName}/_nodes/*/stats'
+              - !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ElasticsearchDomainName}/_stats'
+              - !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ElasticsearchDomainName}/${ElasticsearchIndexName}*/_stats'
+          - Effect: Allow
+            Action:
+              - 'logs:PutLogEvents'
+            Resource:
+              - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/:log-stream:*'
+          - Effect: Allow
+            Action:
+              - 'kinesis:DescribeStream'
+              - 'kinesis:GetShardIterator'
+              - 'kinesis:GetRecords'
+            Resource: !Sub 'arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/%FIREHOSE_STREAM_NAME%'
+          - Effect: Allow
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+            Resource:
+              - !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/%SSE_KEY_ARN%'
+            Condition:
+              StringEquals:
+                'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'
+              StringLike:
+                'kms:EncryptionContext:aws:s3:arn': !Sub 'arn:aws:::${LogBucket}/*'
+
+  LogBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      AccessControl: Private
+Outputs:
+  SageMakerNotebook:
+    Value:
+      Fn::GetAtt:
+      - SageMakerNeptuneStack
+      - Outputs.NeptuneNotebook
+  DBClusterEndpoint:
+    Description: Master Endpoint for Neptune Cluster
+    Value:
+      Fn::GetAtt:
+      - NeptuneBaseStack
+      - Outputs.DBClusterEndpoint
+  DBInstanceEndpoint:
+    Description: Master Instance Endpoint
+    Value:
+      Fn::GetAtt:
+      - NeptuneBaseStack
+      - Outputs.DBInstanceEndpoint
+  GremlinEndpoint:
+    Description: Gremlin Endpoint for Neptune
+    Value:
+      Fn::GetAtt:
+      - NeptuneBaseStack
+      - Outputs.GremlinEndpoint
+  LoaderEndpoint:
+    Description: Loader Endpoint for Neptune
+    Value:
+      Fn::GetAtt:
+      - NeptuneBaseStack
+      - Outputs.LoaderEndpoint
+  DBClusterReadEndpoint:
+    Description: DB cluster Read Endpoint
+    Value:
+      Fn::GetAtt:
+      - NeptuneBaseStack
+      - Outputs.DBClusterReadEndpoint
+
