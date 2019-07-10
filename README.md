@@ -11,6 +11,6 @@ The architecture makes use of the following AWS services:
 
 To set the scene on the demo see the following video.
 
-[![IMAGE ALT TEXT HERE](https://img.youtube.com/vi/-w6duQhWuVk/0.jpg)](https://www.youtube.com/watch?v=-w6duQhWuVk)
+[![IMAGE ALT TEXT HERE](https://img.youtube.com/vi/-w6duQhWuVk/0.jpg)](https://www.youtube.com/watch?v=-w6duQhWuVk){target="_blank"}
 
 # Deployment guide
